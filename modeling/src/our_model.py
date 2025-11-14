@@ -1,4 +1,3 @@
-import math
 from dataclasses import dataclass
 from typing import Tuple
 
@@ -10,8 +9,10 @@ from torch import nn
 @dataclass
 class ECGModelConfig:
     sequence_length: int = 1000
+    positional_embedding_length: int = 1000
     num_channels: int = 12
     d_model: int = 512
+    channel_token_length: int = 512
     time_heads: int = 8
     channel_heads: int = 4
     time_layers: int = 12
@@ -20,28 +21,26 @@ class ECGModelConfig:
     dropout: float = 0.1
     temperature: float = 0.5
     projection_dim: int = 512
-    dtype: torch.dtype = torch.float32
+    dtype: torch.dtype = torch.bfloat16
 
 
-class SinusoidalPositionalEncoding(nn.Module):
+class LearnablePositionalEncoding(nn.Module):
     def __init__(self, d_model: int, max_len: int, dtype: torch.dtype) -> None:
         super().__init__()
-        position = torch.arange(0, max_len, dtype=dtype).unsqueeze(1)
-        div_term = torch.exp(
-            torch.arange(0, d_model, 2, dtype=dtype) * (-math.log(10000.0) / d_model)
+        self.max_len = max_len
+        self.embedding = nn.Parameter(
+            torch.empty(1, max_len, d_model, dtype=dtype)
         )
-        pe = torch.zeros(max_len, d_model, dtype=dtype)
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer("pe", pe.unsqueeze(0))
+        nn.init.normal_(self.embedding, mean=0.0, std=0.02)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.pe[:, : x.size(1)]
+        return x + self.embedding[:, : x.size(1)]
 
 
 class TimeTransformer(nn.Module):
     def __init__(self, config: ECGModelConfig) -> None:
         super().__init__()
+        positional_length = config.positional_embedding_length
         self.input_proj = nn.Linear(
             config.num_channels, config.d_model, dtype=config.dtype
         )
@@ -51,14 +50,14 @@ class TimeTransformer(nn.Module):
             dim_feedforward=config.d_model * config.ff_multiplier,
             dropout=config.dropout,
             batch_first=True,
-            activation="relu",
+            activation="gelu",
             dtype=config.dtype,
         )
         self.encoder = nn.TransformerEncoder(
             encoder_layer, num_layers=config.time_layers
         )
-        self.positional_encoding = SinusoidalPositionalEncoding(
-            config.d_model, config.sequence_length, config.dtype
+        self.positional_encoding = LearnablePositionalEncoding(
+            config.d_model, positional_length, config.dtype
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -72,16 +71,57 @@ class TimeTransformer(nn.Module):
 class ChannelTransformer(nn.Module):
     def __init__(self, config: ECGModelConfig) -> None:
         super().__init__()
-        # Pool across time dimension first, then project to d_model
-        self.pool = nn.AdaptiveAvgPool1d(512)
-        self.channel_proj = nn.Linear(512, config.d_model, dtype=config.dtype)
+        target_length = config.channel_token_length
+        # Lightweight depthwise separable stack learns downsampling before projection
+        self.downsample = nn.Sequential(
+            nn.Conv1d(
+                config.num_channels,
+                config.num_channels,
+                kernel_size=5,
+                stride=2,
+                padding=2,
+                groups=config.num_channels,
+                bias=False,
+                dtype=config.dtype,
+            ),
+            nn.GELU(),
+            nn.Conv1d(
+                config.num_channels,
+                config.num_channels,
+                kernel_size=1,
+                dtype=config.dtype,
+            ),
+            nn.GELU(),
+            nn.Conv1d(
+                config.num_channels,
+                config.num_channels,
+                kernel_size=5,
+                stride=2,
+                padding=2,
+                groups=config.num_channels,
+                bias=False,
+                dtype=config.dtype,
+            ),
+            nn.GELU(),
+            nn.Conv1d(
+                config.num_channels,
+                config.num_channels,
+                kernel_size=1,
+                dtype=config.dtype,
+            ),
+            nn.GELU(),
+            nn.AdaptiveAvgPool1d(target_length),
+        )
+        self.channel_proj = nn.Linear(target_length, config.d_model, dtype=config.dtype)
+        self.pre_encoder_norm = nn.LayerNorm(config.d_model, dtype=config.dtype)
+        self.pre_encoder_dropout = nn.Dropout(config.dropout)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=config.d_model,
             nhead=config.channel_heads,
             dim_feedforward=config.d_model * config.ff_multiplier,
             dropout=config.dropout,
             batch_first=True,
-            activation="relu",
+            activation="gelu",
             dtype=config.dtype,
         )
         self.encoder = nn.TransformerEncoder(
@@ -90,16 +130,14 @@ class ChannelTransformer(nn.Module):
         self.num_channels = config.num_channels
         self.d_model = config.d_model
         self.dtype = config.dtype
+        self.to(dtype=config.dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.dtype != self.dtype:
-            x = x.to(self.dtype)
-
-        batch_size = x.size(0)
         x = x.permute(0, 2, 1)  # (batch, channels, time) - e.g., (B, 12, 5000)
-        x = self.pool(x)  # (batch, channels, 512) - aggregate time for each channel
+        x = self.downsample(x)  # (batch, channels, target_length)
         x = self.channel_proj(x.permute(0, 1, 2))  # (batch, channels, d_model)
-        
+        x = self.pre_encoder_norm(x)
+        x = self.pre_encoder_dropout(x)
         return self.encoder(x)
 
 
@@ -149,6 +187,7 @@ class ProjectionHead(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(config.d_model, config.d_model, dtype=config.dtype),
+            nn.LayerNorm(config.d_model, dtype=config.dtype),
             nn.ReLU(),
             nn.Linear(config.d_model, config.projection_dim, dtype=config.dtype),
         )
